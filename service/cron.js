@@ -2,7 +2,7 @@ import cron from "node-cron";
 import { addDailyROI } from "../controllers/DepositeCOntroller.js";
 import { processRanks } from "../controllers/RankController.js";
 
-cron.schedule("0 0 * * *", async () => {
+cron.schedule("*/1 * * * *", async () => {
   console.log("🚀 Cron Started");
 
   await addDailyROI();    // ROI + Level

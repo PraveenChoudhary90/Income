@@ -13,6 +13,13 @@ const userSchema = new mongoose.Schema({
     default: null
   },
 
+  // 🔹 Track first deposit
+  isActiveDeposit: { type: Boolean, default: false },
+  activationDate: { type: Date, default: null },
+
+  // 🔹 Total deposit amount for user
+  totalDepositAmount: { type: Number, default: 0 },
+
   // 🔥 NEW FIELDS FOR RANK SYSTEM
   rank: {
     type: String,

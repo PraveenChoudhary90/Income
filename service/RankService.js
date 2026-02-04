@@ -3,7 +3,7 @@ import Deposit from "../models/DepositeModel.js";
 import IncomeLedger from "../models/RefrralIncomebonusmodel.js";
 
 /* ==============================
-   RANK TABLE
+   RANK TABLE (IMAGE BASED)
 ============================== */
 export const rankTable = [
   { rank: "A", name: "Associate", amount: 10000, percent: 0.10 },
@@ -17,132 +17,148 @@ export const rankTable = [
   { rank: "I", name: "Global Ambassador", amount: 10000000, percent: 0.80 }
 ];
 
-/* ==============================
-   🔁 FULL DOWNLINE BUSINESS
-============================== */
-async function getFullDownlineBusiness(userId) {
+/* ======================================================
+   GET FULL DOWNLINE BUSINESS (BFS - NO RECURSION)
+====================================================== */
+async function getFullDownlineBusiness(rootUserId) {
+
   let total = 0;
+  let queue = [rootUserId];
 
-  const deposits = await Deposit.find({ userId });
-  total += deposits.reduce((s, d) => s + d.amount, 0);
+  while (queue.length) {
 
-  const children = await User.find({ referredBy: userId });
-  for (const child of children) {
-    total += await getFullDownlineBusiness(child._id);
+    const current = queue;
+    queue = [];
+
+    const deposits = await Deposit.find({
+      userId: { $in: current }
+    });
+
+    total += deposits.reduce((sum, d) => sum + d.amount, 0);
+
+    const children = await User.find({
+      referredBy: { $in: current }
+    });
+
+    children.forEach(c => queue.push(c._id));
   }
 
   return total;
 }
 
-/* ==============================
-   LEADERSHIP BUSINESS
-   (MIN 3 LEGS, MAX 11 LEGS)
-============================== */
-async function calculateLeadershipBusiness(userId) {
+/* ======================================================
+   40-30-30 LEADERSHIP CALCULATION
+====================================================== */
+async function calculateLeadershipAmount(userId) {
+
   const directLegs = await User.find({ referredBy: userId });
 
-  if (!directLegs || directLegs.length < 3) {
-    return { total: 0, legs: [] };
+  if (directLegs.length < 3) return 0; // image rule
+
+  let legBusiness = [];
+
+  for (const leg of directLegs) {
+    const business = await getFullDownlineBusiness(leg._id);
+    legBusiness.push(business);
   }
 
-  let legs = [];
+  legBusiness.sort((a, b) => b - a);
 
-  for (const legUser of directLegs) {
-    const legBusiness = await getFullDownlineBusiness(legUser._id);
-    legs.push({
-      userId: legUser._id,
-      name: legUser.name,
-      amount: legBusiness
-    });
-  }
+  const top = legBusiness[0] || 0;
+  const second = legBusiness[1] || 0;
+  const remaining = legBusiness.slice(2)
+    .reduce((sum, v) => sum + v, 0);
 
-  // Sort high → low
-  legs.sort((a, b) => b.amount - a.amount);
+  const leadershipAmount =
+    (top * 0.40) +
+    (second * 0.30) +
+    (remaining * 0.30);
 
-  // Max 11 legs
-  legs = legs.slice(0, 11);
-
-  const first = legs[0].amount * 0.40;
-  const second = legs[1].amount * 0.30;
-  const remainingSum = legs.slice(2).reduce((s, l) => s + l.amount, 0);
-  const third = remainingSum * 0.30;
-
-  return {
-    total: parseFloat((first + second + third).toFixed(2)),
-    legs
-  };
+  return Number(leadershipAmount.toFixed(2));
 }
 
-/* ==============================
+/* ======================================================
    PROCESS RANKS
-   (INCOME ONLY ON FIRST ACHIEVE)
-============================== */
+====================================================== */
 export const processRanks = async () => {
-  const users = await User.find();
 
-  for (const user of users) {
-    const { total, legs } = await calculateLeadershipBusiness(user._id);
+  try {
 
-    if (total <= 0) continue;
+    const users = await User.find();
 
-    const currentRankIndex = rankTable.findIndex(
-      r => r.rank === user.rank
-    );
+    for (const user of users) {
 
-    let achievedRank = null;
+      const leadershipAmount =
+        await calculateLeadershipAmount(user._id);
 
-    // Highest eligible rank only
-    for (let i = rankTable.length - 1; i >= 0; i--) {
-      if (total >= rankTable[i].amount && i > currentRankIndex) {
-        achievedRank = rankTable[i];
-        break;
+      if (leadershipAmount <= 0) continue;
+
+      const currentIndex = rankTable.findIndex(
+        r => r.rank === user.rank
+      );
+
+      let achievedRank = null;
+
+      // highest eligible rank check
+      for (let i = rankTable.length - 1; i >= 0; i--) {
+
+        if (
+          leadershipAmount >= rankTable[i].amount &&
+          i > currentIndex
+        ) {
+          achievedRank = rankTable[i];
+          break;
+        }
       }
+
+      if (!achievedRank) continue;
+
+      // prevent duplicate rank income
+      const existing = await IncomeLedger.findOne({
+        toUser: user._id,
+        type: "RANKINCOME",
+        note: `Rank Income - ${achievedRank.rank}`
+      });
+
+      if (existing) continue;
+
+      const rankIncome =
+        achievedRank.amount * achievedRank.percent;
+
+      // update user
+      user.rank = achievedRank.rank;
+
+      user.wallet.rankIncome =
+        (user.wallet.rankIncome || 0) + rankIncome;
+
+      user.wallet.balance += rankIncome;
+
+      user.markModified("wallet");
+      await user.save();
+
+      // ledger entry
+      await IncomeLedger.create({
+        toUser: user._id,
+        amount: rankIncome,
+        depositAmount: leadershipAmount, // total downline business used to calculate rank income
+       percent: achievedRank.percent * 100,
+        type: "RANKINCOME",
+        status: "credited",
+        note: `Rank Income - ${achievedRank.rank}`,
+        currency: "INR"
+      });
+
+      console.log("==================================");
+      console.log(`USER: ${user.name}`);
+      console.log(`LEADERSHIP: ${leadershipAmount}`);
+      console.log(`RANK: ${achievedRank.name}`);
+      console.log(`INCOME: ${rankIncome}`);
+      console.log("==================================");
     }
 
-    if (!achievedRank) continue;
+    console.log("✅ Rank Processing Completed");
 
-    // 🛑 SAFETY: Already credited?
-    const alreadyCredited = await IncomeLedger.findOne({
-      toUser: user._id,
-      type: "RANKINCOME",
-      note: `Rank Income for ${achievedRank.name}`
-    });
-
-    if (alreadyCredited) continue;
-
-    const rankIncome = parseFloat(
-      (achievedRank.amount * achievedRank.percent).toFixed(2)
-    );
-
-    // SAVE RANK & ADD INCOME
-    user.rank = achievedRank.rank;
-    user.wallet.rankIncome =
-      (user.wallet.rankIncome || 0) + rankIncome;
-    user.wallet.balance += rankIncome;
-
-    user.markModified("wallet");
-    await user.save();
-
-    // LEDGER ENTRY
-    await IncomeLedger.create({
-      fromUser: user._id,
-      toUser: user._id,
-      amount: rankIncome,
-      type: "RANKINCOME",
-      status: "credited",
-      note: `Rank Income for ${achievedRank.name}`,
-      currency: "INR"
-    });
-
-    console.log("=================================");
-    console.log(`USER: ${user.name}`);
-    console.log(`NEW RANK: ${achievedRank.name}`);
-    console.log(`TOTAL BUSINESS: ${total}`);
-    console.log(`RANK INCOME CREDITED: ${rankIncome}`);
-    console.log(
-      "LEG WISE:",
-      legs.map(l => `${l.name} → ${l.amount}`)
-    );
-    console.log("=================================");
+  } catch (err) {
+    console.error("❌ Rank Error:", err);
   }
 };

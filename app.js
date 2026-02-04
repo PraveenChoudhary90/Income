@@ -5,11 +5,11 @@ import connectDB from "./config/db.js";
 import UserRoutes from "./routes/UserRoutes.js";
 import depositRoutes from "./routes/DepositeRoute.js";
 import RankCheckRoute from "./routes/RankCheckRoute.js";
-import { addDailyROI } from "./controllers/DepositeCOntroller.js";
-import { processRanks } from "./controllers/RankController.js";
+// import { addDailyROI } from "./controllers/DepositeCOntroller.js";
+// import { processRanks } from "./controllers/RankController.js";
 
 
-// import "./service/cron.js";
+import "./service/cron.js";
 // import "./service/DailyRois.js";
 
 dotenv.config();
@@ -19,8 +19,8 @@ const app = express();
 app.use(express.json());
 
 
-await addDailyROI();
-await processRanks();
+// await addDailyROI();
+// await processRanks();
 
 app.use("/api/auth", UserRoutes);
 app.use("/api", depositRoutes);

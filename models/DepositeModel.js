@@ -15,10 +15,10 @@ const DepositSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
-    referralGiven: {
-      type: Boolean,
-      default: false, // ensures referral bonus given only once per deposit
-    },
+    // referralGiven: {
+    //   type: Boolean,
+    //   default: false, // ensures referral bonus given only once per deposit
+    // },
     isActive: {
       type: Boolean,
       default: false, // deposit is active and earning daily ROI

@@ -15,17 +15,19 @@ const getDailyROI = (amount) => {
 
 /* ================================
    CREATE DEPOSIT
+   Referral + DailyIncome (once)
 ================================ */
 export const createDeposit = async (req, res) => {
   try {
     const { userId, amount } = req.body;
-
     const roi = getDailyROI(amount);
     if (!roi) return res.status(400).json({ message: "Invalid deposit amount" });
 
     const dailyProfit = amount * roi;
-
     const depositsCount = await Deposit.countDocuments({ userId });
+    const user = await User.findById(userId);
+
+    const isFirstDeposit = !user.isActiveDeposit;
 
     const deposit = await Deposit.create({
       userId,
@@ -34,47 +36,74 @@ export const createDeposit = async (req, res) => {
       isActive: depositsCount === 0 ? true : false,
     });
 
-    const user = await User.findById(userId);
+    // Update user for first deposit
+    if (isFirstDeposit) {
+      user.isActiveDeposit = true;
+      user.activationDate = new Date();
+    }
 
-    // 5% DIRECT REFERRAL BONUS
+    user.totalDepositAmount = (user.totalDepositAmount || 0) + amount;
+    await user.save();
+
+    // 5% DIRECT REFERRAL BONUS (Duplicate-safe)
     if (user.referredBy) {
       const referrer = await User.findById(user.referredBy);
       if (referrer) {
-        const bonus = amount * 0.05;
-        referrer.wallet.balance += bonus;
-        referrer.wallet.referralIncome = (referrer.wallet.referralIncome || 0) + bonus;
-        referrer.markModified("wallet");
-        await referrer.save();
-
-        await IncomeLedger.create({
-          fromUser: user._id,
-          toUser: referrer._id,
-          amount: bonus,
-          type: "REFERRAL",
-          status: "credited",
+        const existingReferral = await IncomeLedger.findOne({
           depositId: deposit._id,
-          note: `5% referral bonus from ${user.name}`,
-          currency: "INR",
+          toUser: referrer._id,
+          type: "REFERRAL",
         });
+
+        if (!existingReferral) {
+          const bonus = amount * 0.05;
+          referrer.wallet.balance += bonus;
+          referrer.wallet.referralIncome = (referrer.wallet.referralIncome || 0) + bonus;
+          referrer.markModified("wallet");
+          await referrer.save();
+
+          await IncomeLedger.create({
+            fromUser: user._id,
+            toUser: referrer._id,
+            amount: bonus,
+            depositAmount: amount,
+            percent: 0.05 * 100,
+            type: "REFERRAL",
+            status: "credited",
+            depositId: deposit._id,
+            note: `5% referral bonus from ${user.name}`,
+            currency: "INR",
+          });
+        }
       }
     }
 
-    // FIRST DAY ROI CREDIT
-    user.wallet.balance += dailyProfit;
-    user.wallet.DailyIncome = (user.wallet.DailyIncome || 0) + dailyProfit;
-    user.markModified("wallet");
-    await user.save();
-
-    await IncomeLedger.create({
-      fromUser: user._id,
-      toUser: user._id,
-      amount: dailyProfit,
-      type: "DAILYINCOME",
-      status: "credited",
+    // FIRST DAY ROI CREDIT (Duplicate-safe)
+    const existingDaily = await IncomeLedger.findOne({
       depositId: deposit._id,
-      note: `Daily ROI credited`,
-      currency: "INR",
+      toUser: user._id,
+      type: "DAILYINCOME",
     });
+
+    if (!existingDaily) {
+      user.wallet.balance += dailyProfit;
+      user.wallet.DailyIncome = (user.wallet.DailyIncome || 0) + dailyProfit;
+      user.markModified("wallet");
+      await user.save();
+
+      await IncomeLedger.create({
+        fromUser: user._id,
+        toUser: user._id,
+        amount: dailyProfit,
+        depositAmount: deposit.amount,
+        percent: roi * 100,
+        type: "DAILYINCOME",
+        status: "credited",
+        depositId: deposit._id,
+        note: `Daily ROI credited`,
+        currency: "INR",
+      });
+    }
 
     res.json({ message: "Deposit Successful", dailyProfit });
   } catch (error) {
@@ -84,8 +113,7 @@ export const createDeposit = async (req, res) => {
 };
 
 /* ================================
-   CRON JOB FUNCTION
-   DAILY ROI + NESTED LEVEL INCOME
+   CRON JOB: LEVEL INCOME ONLY
 ================================ */
 export const addDailyROI = async () => {
   try {
@@ -95,45 +123,34 @@ export const addDailyROI = async () => {
       const depositor = await User.findById(dep.userId);
       if (!depositor) continue;
 
-      // 1️⃣ DAILY ROI
-      depositor.wallet.balance += dep.dailyProfit;
-      depositor.wallet.DailyIncome = (depositor.wallet.DailyIncome || 0) + dep.dailyProfit;
-      depositor.markModified("wallet");
-      await depositor.save();
+      let currentUplineId = depositor.referredBy;
+      let currentLevel = 1;
 
-      await IncomeLedger.create({
-        fromUser: depositor._id,
-        toUser: depositor._id,
-        amount: dep.dailyProfit,
-        type: "DAILYINCOME",
-        status: "credited",
-        depositId: dep._id,
-        note: `Daily ROI credited (Cron)`,
-        currency: "INR",
-      });
+      while (currentUplineId && currentLevel <= 40) {
+        const upline = await User.findById(currentUplineId);
+        if (!upline) break;
 
-      // 2️⃣ NESTED LEVEL INCOME
-      const processUpline = async (currentUserId, currentLevel, maxDirects = 11) => {
-        if (!currentUserId || currentLevel > 40) return;
+        const directUsers = await User.find({ referredBy: upline._id });
+        let qualifiedDirects = 0;
 
-        const upline = await User.findById(currentUserId);
-        if (!upline) return;
+        for (const direct of directUsers) {
+          const totalDeposit = await Deposit.aggregate([
+            { $match: { userId: direct._id, isActive: true } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ]);
+          const total = totalDeposit[0]?.total || 0;
+          if (total >= 1100) qualifiedDirects++;
+        }
 
-        const directRefCount = await User.countDocuments({ referredBy: upline._id });
+        let requiredDirect;
+        if (currentLevel === 1) requiredDirect = 1;
+        else if (currentLevel === 2) requiredDirect = 2;
+        else if (currentLevel === 3) requiredDirect = 3;
+        else if (currentLevel === 4) requiredDirect = 4;
+        else if (currentLevel >= 5 && currentLevel <= 10) requiredDirect = 6;
+        else if (currentLevel >= 11 && currentLevel <= 30) requiredDirect = 8;
+        else requiredDirect = 11;
 
-        // Minimum Directs per level
-        let minDirect;
-        if (currentLevel === 1) minDirect = 1;
-        else if (currentLevel === 2) minDirect = 2;
-        else if (currentLevel === 3) minDirect = 3;
-        else if (currentLevel === 4) minDirect = 4;
-        else if (currentLevel >= 5 && currentLevel <= 10) minDirect = 6;
-        else if (currentLevel >= 11 && currentLevel <= 30) minDirect = 8;
-        else minDirect = 11; // 31–40
-
-        if (directRefCount < minDirect || directRefCount > maxDirects) return;
-
-        // Percent per level
         let percent;
         if (currentLevel === 1) percent = 0.10;
         else if (currentLevel === 2) percent = 0.07;
@@ -143,33 +160,43 @@ export const addDailyROI = async () => {
         else if (currentLevel >= 11 && currentLevel <= 30) percent = 0.01;
         else percent = 0.005;
 
-        const income = dep.dailyProfit * percent;
+        // LevelIncome Duplicate Check
+        if (qualifiedDirects >= requiredDirect) {
+          const existingLevel = await IncomeLedger.findOne({
+            depositId: dep._id,
+            toUser: upline._id,
+            type: "LEVELINCOME",
+            note: `Level ${currentLevel} income from ${depositor.name}`,
+          });
 
-        upline.wallet.balance += income;
-        upline.wallet.levelIncome = (upline.wallet.levelIncome || 0) + income;
-        upline.markModified("wallet");
-        await upline.save();
+          if (!existingLevel) {
+            const income = dep.dailyProfit * percent;
+            upline.wallet.balance += income;
+            upline.wallet.levelIncome = (upline.wallet.levelIncome || 0) + income;
+            upline.markModified("wallet");
+            await upline.save();
 
-        await IncomeLedger.create({
-          fromUser: depositor._id,
-          toUser: upline._id,
-          amount: income,
-          type: "LEVELINCOME",
-          status: "credited",
-          depositId: dep._id,
-          note: `Level ${currentLevel} income from ${depositor.name}`,
-          currency: "INR",
-        });
+            await IncomeLedger.create({
+              fromUser: depositor._id,
+              toUser: upline._id,
+              amount: income,
+              depositAmount: dep.amount,
+              percent: percent * 100,
+              type: "LEVELINCOME",
+              status: "credited",
+              depositId: dep._id,
+              note: `Level ${currentLevel} income from ${depositor.name}`,
+              currency: "INR",
+            });
+          }
+        }
 
-        console.log(`[Level ${currentLevel}] ${upline.name} received ${income} INR`);
-
-        await processUpline(upline.referredBy, currentLevel + 1, maxDirects);
-      };
-
-      await processUpline(depositor.referredBy, 1, 11);
+        currentUplineId = upline.referredBy;
+        currentLevel++;
+      }
     }
 
-    console.log("✅ Cron Finished: Daily ROI + Nested Level Income Added");
+    console.log("✅ Cron Finished: Level Income Added");
   } catch (error) {
     console.error("❌ Error in Cron:", error);
   }
