@@ -7,6 +7,7 @@ import depositRoutes from "./routes/DepositeRoute.js";
 import RankCheckRoute from "./routes/RankCheckRoute.js";
 // import { addDailyROI } from "./controllers/DepositeCOntroller.js";
 // import { processRanks } from "./controllers/RankController.js";
+import WithdrawRoute  from "./routes/Withdrawroute.js";
 
 
 import "./service/cron.js";
@@ -25,6 +26,7 @@ app.use(express.json());
 app.use("/api/auth", UserRoutes);
 app.use("/api", depositRoutes);
 app.use("/api/rank", RankCheckRoute);
+app.use("/api", WithdrawRoute);
 
 
 const port = process.env.PORT || 8000
