@@ -17,6 +17,12 @@ const incomeLedgerSchema = new mongoose.Schema({
   status: { type: String, default: "credited" },
   date: { type: Date, default: Date.now },
   depositId: { type: mongoose.Schema.Types.ObjectId, ref: "Deposit" },
+
+  rank: { type: String },
+  rankName: { type: String },
+  rankPercent: { type: Number },
+
+
   note: { type: String, default: "" },
   currency: { type: String, default: "INR" }
 }, { timestamps: true });

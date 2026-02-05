@@ -180,7 +180,7 @@ export const addDailyROI = async () => {
               fromUser: depositor._id,
               toUser: upline._id,
               amount: income,
-              depositAmount: dep.amount,
+              depositAmount: dep.dailyProfit,
               percent: percent * 100,
               type: "LEVELINCOME",
               status: "credited",
