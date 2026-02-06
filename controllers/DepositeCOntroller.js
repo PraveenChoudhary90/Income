@@ -3,7 +3,7 @@ import User from "../models/UserModel.js";
 import IncomeLedger from "../models/RefrralIncomebonusmodel.js";
 
 /* ================================
-   DAILY ROI PERCENT LOGIC
+   DAILY ROI LOGIC
 ================================ */
 const getDailyROI = (amount) => {
   if (amount >= 50 && amount <= 500) return 0.0033;
@@ -14,8 +14,7 @@ const getDailyROI = (amount) => {
 };
 
 /* ================================
-   CREATE DEPOSIT
-   Referral + DailyIncome (once)
+   CREATE DEPOSIT + REFERRAL + DAILY ROI
 ================================ */
 export const createDeposit = async (req, res) => {
   try {
@@ -23,12 +22,13 @@ export const createDeposit = async (req, res) => {
     const roi = getDailyROI(amount);
     if (!roi) return res.status(400).json({ message: "Invalid deposit amount" });
 
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
     const dailyProfit = amount * roi;
     const depositsCount = await Deposit.countDocuments({ userId });
-    const user = await User.findById(userId);
 
-    const isFirstDeposit = !user.isActiveDeposit;
-
+    // Create Deposit
     const deposit = await Deposit.create({
       userId,
       amount,
@@ -36,49 +36,68 @@ export const createDeposit = async (req, res) => {
       isActive: depositsCount === 0 ? true : false,
     });
 
-    // Update user for first deposit
-    if (isFirstDeposit) {
+    // Update User deposit info
+    user.totalDepositAmount = (user.totalDepositAmount || 0) + amount;
+    if (!user.isActiveDeposit) {
       user.isActiveDeposit = true;
       user.activationDate = new Date();
     }
-
-    user.totalDepositAmount = (user.totalDepositAmount || 0) + amount;
     await user.save();
 
-    // 5% DIRECT REFERRAL BONUS (Duplicate-safe)
+    const maxLimit = deposit.amount * 2; // per-deposit 2X cap
+
+    /* ================================
+       5% DIRECT REFERRAL BONUS (2X CAPPING)
+    ================================ */
     if (user.referredBy) {
-      const referrer = await User.findById(user.referredBy);
-      if (referrer) {
-        const existingReferral = await IncomeLedger.findOne({
-          depositId: deposit._id,
-          toUser: referrer._id,
-          type: "REFERRAL",
-        });
+  const referrer = await User.findById(user.referredBy);
+  if (referrer) {
+    const existingReferral = await IncomeLedger.findOne({
+      depositId: deposit._id,
+      toUser: referrer._id,
+      type: "REFERRAL",
+    });
 
-        if (!existingReferral) {
-          const bonus = amount * 0.05;
-          referrer.wallet.balance += bonus;
-          referrer.wallet.referralIncome = (referrer.wallet.referralIncome || 0) + bonus;
-          referrer.markModified("wallet");
-          await referrer.save();
+    if (!existingReferral) {
+      const bonus = deposit.amount * 0.05; // full bonus
 
-          await IncomeLedger.create({
-            fromUser: user._id,
-            toUser: referrer._id,
-            amount: bonus,
-            depositAmount: amount,
-            percent: 0.05 * 100,
-            type: "REFERRAL",
-            status: "credited",
-            depositId: deposit._id,
-            note: `5% referral bonus from ${user.name}`,
-            currency: "INR",
-          });
-        }
+      // Wallet credit with 2X cap, user active/inactive irrelevant
+      const totalEarning = (referrer.wallet.referralIncome || 0) +
+                           (referrer.wallet.DailyIncome || 0) +
+                           (referrer.wallet.levelIncome || 0) +
+                           (referrer.wallet.rankIncome || 0);
+
+      const maxLimit = deposit.amount * 2; // 2X cap per deposit
+      const remainingLimit = maxLimit - totalEarning;
+      const finalBonus = bonus > remainingLimit ? remainingLimit : bonus;
+
+      if (finalBonus > 0) {
+        referrer.wallet.balance += finalBonus;
+        referrer.wallet.referralIncome = (referrer.wallet.referralIncome || 0) + finalBonus;
+        referrer.markModified("wallet");
+        await referrer.save();
       }
-    }
 
-    // FIRST DAY ROI CREDIT (Duplicate-safe)
+      // Ledger always full bonus, status credited
+      await IncomeLedger.create({
+        fromUser: user._id,
+        toUser: referrer._id,
+        amount: bonus, // full bonus
+        depositAmount: deposit.amount,
+        percent: 5,
+        type: "REFERRAL",
+        status: "credited", // ✅ hamesha credited
+        depositId: deposit._id,
+        note: `5% referral bonus from ${user.name}`,
+        currency: "INR",
+      });
+    }
+  }
+}
+
+    /* ================================
+       FIRST DAY ROI (2X CAPPING)
+    ================================ */
     const existingDaily = await IncomeLedger.findOne({
       depositId: deposit._id,
       toUser: user._id,
@@ -86,10 +105,19 @@ export const createDeposit = async (req, res) => {
     });
 
     if (!existingDaily) {
-      user.wallet.balance += dailyProfit;
-      user.wallet.DailyIncome = (user.wallet.DailyIncome || 0) + dailyProfit;
-      user.markModified("wallet");
-      await user.save();
+      const totalEarning = (user.wallet.DailyIncome || 0) +
+                           (user.wallet.levelIncome || 0) +
+                           (user.wallet.referralIncome || 0) +
+                           (user.wallet.rankIncome || 0);
+      const remainingLimit = maxLimit - totalEarning;
+      const finalDaily = dailyProfit > remainingLimit ? remainingLimit : dailyProfit;
+
+      if (user.isActiveDeposit && finalDaily > 0) {
+        user.wallet.balance += finalDaily;
+        user.wallet.DailyIncome = (user.wallet.DailyIncome || 0) + finalDaily;
+        user.markModified("wallet");
+        await user.save();
+      }
 
       await IncomeLedger.create({
         fromUser: user._id,
@@ -100,7 +128,7 @@ export const createDeposit = async (req, res) => {
         type: "DAILYINCOME",
         status: "credited",
         depositId: deposit._id,
-        note: `Daily ROI credited`,
+        note: `Daily ROI`,
         currency: "INR",
       });
     }
@@ -113,7 +141,7 @@ export const createDeposit = async (req, res) => {
 };
 
 /* ================================
-   CRON JOB: LEVEL INCOME ONLY
+   CRON: LEVEL + DAILY + RANK INCOME (2X CAPPING)
 ================================ */
 export const addDailyROI = async () => {
   try {
@@ -130,9 +158,11 @@ export const addDailyROI = async () => {
         const upline = await User.findById(currentUplineId);
         if (!upline) break;
 
+        /* =========================
+           LEVEL INCOME CALCULATION
+        ========================= */
         const directUsers = await User.find({ referredBy: upline._id });
         let qualifiedDirects = 0;
-
         for (const direct of directUsers) {
           const totalDeposit = await Deposit.aggregate([
             { $match: { userId: direct._id, isActive: true } },
@@ -160,7 +190,6 @@ export const addDailyROI = async () => {
         else if (currentLevel >= 11 && currentLevel <= 30) percent = 0.01;
         else percent = 0.005;
 
-        // LevelIncome Duplicate Check
         if (qualifiedDirects >= requiredDirect) {
           const existingLevel = await IncomeLedger.findOne({
             depositId: dep._id,
@@ -169,26 +198,41 @@ export const addDailyROI = async () => {
             note: `Level ${currentLevel} income from ${depositor.name}`,
           });
 
-          if (!existingLevel) {
-            const income = dep.dailyProfit * percent;
-            upline.wallet.balance += income;
-            upline.wallet.levelIncome = (upline.wallet.levelIncome || 0) + income;
-            upline.markModified("wallet");
-            await upline.save();
+          const income = dep.dailyProfit * percent;
+          const maxLimit = dep.amount * 2;
+          const totalEarning = (upline.wallet.levelIncome || 0) +
+                               (upline.wallet.DailyIncome || 0) +
+                               (upline.wallet.referralIncome || 0) +
+                               (upline.wallet.rankIncome || 0);
 
-            await IncomeLedger.create({
-              fromUser: depositor._id,
-              toUser: upline._id,
-              amount: income,
-              depositAmount: dep.dailyProfit,
-              percent: percent * 100,
-              type: "LEVELINCOME",
-              status: "credited",
-              depositId: dep._id,
-              note: `Level ${currentLevel} income from ${depositor.name}`,
-              currency: "INR",
-            });
-          }
+          const remainingLimit = maxLimit - totalEarning;
+          const finalIncome = income > remainingLimit ? remainingLimit : income;
+
+          // ✅ Wallet update with 2X cap, active/inactive irrelevant
+  if (finalIncome > 0) {
+    upline.wallet.balance += finalIncome;
+    upline.wallet.levelIncome = (upline.wallet.levelIncome || 0) + finalIncome;
+    upline.markModified("wallet");
+    await upline.save();
+  }
+
+         if (!existingLevel) {
+  await IncomeLedger.create({
+    fromUser: depositor._id,
+    toUser: upline._id,
+    amount: income, // full level income
+    depositAmount: dep.dailyProfit,
+    percent: percent * 100,
+    type: "LEVELINCOME",
+    status: "credited", // always credited
+    depositId: dep._id,
+    note: `Level ${currentLevel} income from ${depositor.name}`,
+    currency: "INR",
+  });
+
+  
+}
+          
         }
 
         currentUplineId = upline.referredBy;
@@ -196,7 +240,7 @@ export const addDailyROI = async () => {
       }
     }
 
-    console.log("✅ Cron Finished: Level Income Added");
+    console.log("✅ Cron Finished: Referral + Daily + Level + Rank Income");
   } catch (error) {
     console.error("❌ Error in Cron:", error);
   }
